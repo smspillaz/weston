@@ -574,17 +574,10 @@ weston_wm_handle_configure_notify(struct weston_wm *wm, xcb_generic_event_t *eve
 	       configure_notify->x, configure_notify->y,
 	       configure_notify->width, configure_notify->height);
 
-	if (our_resource(wm, configure_notify->window))
-		return;
-
 	window = hash_table_lookup(wm->window_hash, configure_notify->window);
-	/* resize falls here */
-	if (configure_notify->window != window->id)
-		return;
-
 	weston_wm_window_get_child_position(window, &x, &y);
-	window->x = configure_notify->x - x;
-	window->y = configure_notify->y - y;
+	window->x = configure_notify->x;
+	window->y = configure_notify->y;
 }
 
 static void
@@ -654,11 +647,7 @@ weston_wm_window_transform(struct wl_listener *listener, void *data)
 	struct weston_wm_window *window = get_wm_window(surface);
 	struct weston_wm *wm =
 		container_of(listener, struct weston_wm, transform_listener);
-	struct weston_output *output = surface->output;
 	uint32_t mask, values[2];
-	float sxf, syf;
-	int sx, sy;
-	static int old_sx = -1, old_sy = -1;
 
 	if (!window || !wm)
 		return;
@@ -666,24 +655,15 @@ weston_wm_window_transform(struct wl_listener *listener, void *data)
 	if (!weston_surface_is_mapped(surface))
 		return;
 
-	weston_surface_to_global_float(surface, output->x, output->y,
-				       &sxf, &syf);
+	if (window->x != surface->geometry.x ||
+	    window->y != surface->geometry.y) {
+		values[0] = surface->geometry.x;
+		values[1] = surface->geometry.y;
+		mask = XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y;
 
-	sx = (int) sxf;
-	sy = (int) syf;
-
-	if (old_sx == sx && old_sy == sy)
-		return;
-
-	values[0] = sx;
-	values[1] = sy;
-	mask = XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y;
-
-	xcb_configure_window(wm->conn, window->frame_id, mask, values);
-	xcb_flush(wm->conn);
-
-	old_sx = sx;
-	old_sy = sy;
+		xcb_configure_window(wm->conn, window->frame_id, mask, values);
+		xcb_flush(wm->conn);
+	}
 }
 
 #define ICCCM_WITHDRAWN_STATE	0
@@ -1537,6 +1517,7 @@ weston_wm_get_resources(struct weston_wm *wm)
 		{ "WM_STATE",		F(atom.wm_state) },
 		{ "WM_S0",		F(atom.wm_s0) },
 		{ "WM_CLIENT_MACHINE",	F(atom.wm_client_machine) },
+		{ "_NET_WM_CM_S0",	F(atom.net_wm_cm_s0) },
 		{ "_NET_WM_NAME",	F(atom.net_wm_name) },
 		{ "_NET_WM_PID",	F(atom.net_wm_pid) },
 		{ "_NET_WM_ICON",	F(atom.net_wm_icon) },
@@ -1691,6 +1672,11 @@ weston_wm_create_wm_window(struct weston_wm *wm)
 	xcb_set_selection_owner(wm->conn,
 				wm->wm_window,
 				wm->atom.wm_s0,
+				XCB_TIME_CURRENT_TIME);
+
+	xcb_set_selection_owner(wm->conn,
+				wm->wm_window,
+				wm->atom.net_wm_cm_s0,
 				XCB_TIME_CURRENT_TIME);
 }
 
@@ -1914,7 +1900,6 @@ xserver_map_shell_surface(struct weston_wm *wm,
 {
 	struct weston_shell_interface *shell_interface =
 		&wm->server->compositor->shell_interface;
-	struct theme *t = window->wm->theme;
 
 	if (!shell_interface->create_shell_surface)
 		return;
@@ -1936,8 +1921,8 @@ xserver_map_shell_surface(struct weston_wm *wm,
 		return;
 	} else {
 		shell_interface->set_xwayland(window->shsurf,
-					      window->x + t->margin,
-					      window->y + t->margin,
+					      window->x,
+					      window->y,
 					      WL_SHELL_SURFACE_TRANSIENT_INACTIVE);
 	}
 }
