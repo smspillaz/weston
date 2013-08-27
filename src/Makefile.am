@@ -22,6 +22,7 @@ weston_SOURCES =				\
 	data-device.c				\
 	filter.c				\
 	filter.h				\
+	composer-protocol.c				\
 	screenshooter.c				\
 	screenshooter-protocol.c		\
 	screenshooter-server-protocol.h		\
@@ -302,6 +303,9 @@ BUILT_SOURCES =					\
 	tablet-shell-server-protocol.h		\
 	desktop-shell-protocol.c		\
 	desktop-shell-server-protocol.h		\
+	composer-protocol.c			\
+	composer-client-protocol.h		\
+	composer-server-protocol.h		\
 	text-protocol.c				\
 	text-server-protocol.h			\
 	input-method-protocol.c			\

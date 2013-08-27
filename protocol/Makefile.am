@@ -8,4 +8,5 @@ EXTRA_DIST =					\
 	workspaces.xml				\
 	subsurface.xml				\
 	text-cursor-position.xml		\
-	wayland-test.xml
+	wayland-test.xml                        \
+	composer.xml

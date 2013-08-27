@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="composer">
+
+  <copyright>
+    Copyright © 2012 Sam Spilsbury
+
+    Permission to use, copy, modify, distribute, and sell this
+    software and its documentation for any purpose is hereby granted
+    without fee, provided that the above copyright notice appear in
+    all copies and that both that copyright notice and this permission
+    notice appear in supporting documentation, and that the name of
+    the copyright holders not be used in advertising or publicity
+    pertaining to distribution of the software without specific,
+    written prior permission.  The copyright holders make no
+    representations about the suitability of this software for any
+    purpose.  It is provided "as is" without express or implied
+    warranty.
+
+    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
+    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+    AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+    THIS SOFTWARE.
+  </copyright>
+
+  <interface name="composer_buffer" version="1">
+    <request name="destroy" verison="1" type="destructor"/>
+    <event name="release" version="1"/>
+  </interface>
+
+  <interface name="composer_shm_pool" version="1">
+    <request name="create_buffer">
+      <arg name="id" type="new_id"/>
+      <arg name="size" type="uint"/>
+      <arg name="offset" type="uint"/>
+    </request>
+  </interface>
+
+  <interface name="composer_surface" version="1">
+    <request name="override_vertex_shader">
+      <arg name="type" type="uint"/>
+      <arg name="source" type="string"/>
+      <arg name="size" type="uint"/>
+    </request>
+    <request name="override_fragment_shader">
+      <arg name="type" type="uint"/>
+      <arg name="source" type="string"/>
+      <arg name="size" type="uint"/>
+    </request>
+    <request name="attach_uniform">
+      <arg name="name" type="string"/>
+      <arg name="size" type="uint"/>
+    </request>
+    <request name="attach_vertex_attribute">
+      <arg name="name" type="string"/>
+      <arg name="size" type="uint"/>
+    </request>
+    <request name="attach_data_buffer">
+      <description summary="shader type">
+        Attach a data buffer to read uniform and vertex data from.
+
+        Data is read from the buffer first in the order of uniforms attached
+        as specified and then subsequently in the order of vertex attributes
+        as specified, repeated for each vertex on the surface.
+
+        The number of vertices is assumed from the size of buffer.
+      </description>
+      <arg name="buffer" type="object" interface="composer_buffer"/>
+    </request>
+    <enum name="shader_type">
+      <description summary="shader type">
+        What type of shader is being modified
+      </description>
+      <entry name="vertex" value="0x0" summary="vertex shader"/>
+      <entry name="fragment" value="0x1" summary="fragment shader"/>
+    </enum>
+
+    <event name="shader_compile_failed">
+      <arg name="log" type="fd"/>
+      <arg name="size" type="uint"/>
+    </event>
+  </interface>
+
+  <interface name="composer_animation_controller" version="1">
+    <description summary="client side animations">
+      The global composer object. This is a singleton used to represent the
+      client side animation system
+    </description>
+
+    <request name="get_composer_surface_animation_controller">
+      <description summary="create a composer surface from a surface">
+        Create a composer surface for an existing surface.
+
+        Only one composer surface can be associated with a given surface.
+      </description>
+
+      <arg name="id" type="new_id" interface="composer_surface"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+
+    <request name="create_shm_pool" version="1">
+      <arg name="id" type="new_id" interface="composer_shm_pool"/>
+      <arg name="fd" type="fd"/>
+      <arg name="size" type="uint"/>
+    </request>
+  </interface>
+
+</protocol>
