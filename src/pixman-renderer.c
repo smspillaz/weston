@@ -672,6 +672,7 @@ pixman_renderer_init(struct weston_compositor *ec)
 	renderer->base.attach = pixman_renderer_attach;
 	renderer->base.create_surface = pixman_renderer_create_surface;
 	renderer->base.surface_set_color = pixman_renderer_surface_set_color;
+	renderer->base.override_gl_hook = NULL;
 	renderer->base.destroy_surface = pixman_renderer_destroy_surface;
 	renderer->base.destroy = pixman_renderer_destroy;
 	ec->renderer = &renderer->base;

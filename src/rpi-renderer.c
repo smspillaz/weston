@@ -1280,6 +1280,7 @@ rpi_renderer_create(struct weston_compositor *compositor,
 	renderer->base.attach = rpi_renderer_attach;
 	renderer->base.create_surface = rpi_renderer_create_surface;
 	renderer->base.surface_set_color = rpi_renderer_surface_set_color;
+	renderer->base.override_gl_hook = NULL;
 	renderer->base.destroy_surface = rpi_renderer_destroy_surface;
 	renderer->base.destroy = rpi_renderer_destroy;
 

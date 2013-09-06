@@ -498,6 +498,20 @@ struct weston_plane {
 	struct wl_list link;
 };
 
+enum renderer_variable_sizes {
+	V1Float = 0, /* 1 float */
+	V2Float,
+	V3Float,
+	V4Float,
+	V1Int, /* 1 int */
+	V2Int,
+	V3Int,
+	V4Int,
+	V2FMatrix, /* 2 float-matrix */
+	V3FMatrix,
+	V4FMatrix
+};
+
 struct weston_renderer {
 	int (*read_pixels)(struct weston_output *output,
 			       pixman_format_code_t format, void *pixels,
@@ -511,6 +525,16 @@ struct weston_renderer {
 	void (*surface_set_color)(struct weston_surface *surface,
 			       float red, float green,
 			       float blue, float alpha);
+	void (*override_gl_hook) (struct weston_surface *surface,
+				  const char *vertex_shader,
+				  const char *fragment_shader,
+				  char **uniforms,
+				  enum renderer_variable_sizes *uniform_sizes,
+				  uint32_t n_uniforms,
+				  char **attributes,
+				  enum renderer_variable_sizes *attribute_sizes,
+				  uint32_t n_attributes,
+				  void *data_buffer);
 	void (*destroy_surface)(struct weston_surface *surface);
 	void (*destroy)(struct weston_compositor *ec);
 };
@@ -521,6 +545,9 @@ enum weston_capability {
 
 	/* screencaptures need to be y-flipped */
 	WESTON_CAP_CAPTURE_YFLIP		= 0x0002,
+
+	/* can override gl shaders and other surface data */
+	WESTON_CAP_OVERRIDE                     = 0x0004
 };
 
 struct weston_compositor {
@@ -812,6 +839,8 @@ struct weston_surface {
 	 */
 	struct wl_list subsurface_list; /* weston_subsurface::parent_link */
 	struct wl_list subsurface_list_pending; /* ...::parent_link_pending */
+
+	struct composer_surface *csurface;
 };
 
 enum weston_key_state_update {

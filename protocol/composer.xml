@@ -32,24 +32,44 @@
   </interface>
 
   <interface name="composer_shm_pool" version="1">
-    <request name="create_buffer">
-      <arg name="id" type="new_id"/>
+    <request name="create_buffer" version="1">
+      <arg name="id" type="new_id" interface="composer_buffer"/>
       <arg name="size" type="uint"/>
       <arg name="offset" type="uint"/>
     </request>
+    <request name="resize" version="1">
+      <arg name="size" type="uint"/>
+    </request>
+    <request name="destroy" version="1" type="destructor"/>
   </interface>
 
   <interface name="composer_surface" version="1">
     <request name="override_vertex_shader">
-      <arg name="type" type="uint"/>
       <arg name="source" type="string"/>
       <arg name="size" type="uint"/>
     </request>
     <request name="override_fragment_shader">
-      <arg name="type" type="uint"/>
       <arg name="source" type="string"/>
       <arg name="size" type="uint"/>
     </request>
+
+    <enum name="variable_size">
+      <description summary="variable size">
+        This is the different sizes that a variable can have
+      </description>
+      <entry name="float" value="0" summary="float"/>
+      <entry name="vec2" value="1" summary="vec2"/>
+      <entry name="vec3" value="2" summary="vec3"/>
+      <entry name="vec4" value="3" summary="vec4"/>
+      <entry name="int" value="4" summary="int"/>
+      <entry name="ivec2" value="5" summary="ivec2"/>
+      <entry name="ivec3" value="6" summary="ivec3"/>
+      <entry name="ivec4" value="7" summary="ivec4"/>
+      <entry name="mat2" value="8" summary="mat2"/>
+      <entry name="mat3" value="9" summary="mat3"/>
+      <entry name="mat4" value="10" summary="mat4"/>
+    </enum>
+
     <request name="attach_uniform">
       <arg name="name" type="string"/>
       <arg name="size" type="uint"/>
@@ -70,13 +90,7 @@
       </description>
       <arg name="buffer" type="object" interface="composer_buffer"/>
     </request>
-    <enum name="shader_type">
-      <description summary="shader type">
-        What type of shader is being modified
-      </description>
-      <entry name="vertex" value="0x0" summary="vertex shader"/>
-      <entry name="fragment" value="0x1" summary="fragment shader"/>
-    </enum>
+    <request name="destroy" type="destructor"/>
 
     <event name="shader_compile_failed">
       <arg name="log" type="fd"/>
@@ -101,7 +115,7 @@
       <arg name="surface" type="object" interface="wl_surface"/>
     </request>
 
-    <request name="create_shm_pool" version="1">
+    <request name="create_shm_pool">
       <arg name="id" type="new_id" interface="composer_shm_pool"/>
       <arg name="fd" type="fd"/>
       <arg name="size" type="uint"/>

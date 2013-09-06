@@ -90,6 +90,7 @@ noop_renderer_init(struct weston_compositor *ec)
 	renderer->attach = noop_renderer_attach;
 	renderer->create_surface = noop_renderer_create_surface;
 	renderer->surface_set_color = noop_renderer_surface_set_color;
+	renderer->override_gl_hook = NULL;
 	renderer->destroy_surface = noop_renderer_destroy_surface;
 	renderer->destroy = noop_renderer_destroy;
 	ec->renderer = renderer;

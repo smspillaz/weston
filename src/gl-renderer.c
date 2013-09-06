@@ -77,6 +77,34 @@ struct gl_surface_state {
 	enum buffer_type buffer_type;
 	int pitch; /* in pixels */
 	int height; /* in pixels */
+
+	struct {
+		int use_override;
+
+		char *override_vertex_shader_string;
+		char *override_fragment_shader_string;
+
+		GLuint override_vertex_shader_id;
+		GLuint override_fragment_shader_id;
+
+		GLuint override_program;
+
+		char **override_uniform_names;
+		enum renderer_variable_sizes *override_uniform_sizes;
+		uint32_t n_uniforms;
+		struct wl_array uniform_bindings;
+
+		GLuint tex_uniforms[3];
+
+		const char **override_attribute_names;
+		enum renderer_variable_sizes *override_attribute_sizes;
+		uint32_t n_attributes;
+		struct wl_array attribute_bindings;
+
+		void *override_data;
+
+		uint32_t relink_needed;
+	} override;
 };
 
 struct gl_renderer {
@@ -123,6 +151,80 @@ struct gl_renderer {
 	struct gl_shader solid_shader;
 	struct gl_shader *current_shader;
 };
+
+static void print_float_array (void *data, size_t size)
+{
+	size_t n = size / sizeof (float);
+	size_t i = 0;
+	float *fdata = (float *) data;
+
+	printf (" (as float) : ");
+	for (; i < n; ++i)
+		printf ("%f, ", fdata[i]);
+	printf ("\n");
+}
+
+static void print_int_array (void *data, size_t size)
+{
+	size_t n = size / sizeof (float);
+	size_t i = 0;
+	int *idata = (int *) data;
+
+	printf (" (as float) : ");
+	for (; i < n; ++i)
+		printf ("%i, ", idata[i]);
+	printf ("\n");
+}
+
+static void uniform_matrix_2fv_wrapper (GLint location,
+					GLsizei count,
+					const GLvoid *data)
+{
+	glUniformMatrix2fv (location, count, GL_FALSE, (const GLfloat *) data);
+}
+
+static void uniform_matrix_3fv_wrapper (GLint location,
+					GLsizei count,
+					const GLvoid *data)
+{
+	glUniformMatrix3fv (location, count, GL_FALSE, (const GLfloat *) data);
+}
+
+static void uniform_matrix_4fv_wrapper (GLint location,
+					GLsizei count,
+					const GLvoid *data)
+{
+	glUniformMatrix4fv (location, count, GL_FALSE, (const GLfloat *) data);
+}
+
+typedef void (*print_variable_of_size) (void *data, size_t size);
+typedef void (*set_uniform_of_size) (GLint location,
+				     GLsizei count,
+				     const GLvoid *data);
+
+struct renderer_variable_info
+{
+  const char *glsl_type;
+  size_t     size;
+  print_variable_of_size print;
+  set_uniform_of_size set;
+} variable_size_table[] =
+{
+	{ "float", sizeof (float), print_float_array, (set_uniform_of_size) glUniform1fv },
+	{ "vec2", sizeof (float) * 2, print_float_array, (set_uniform_of_size) glUniform2fv },
+	{ "vec3", sizeof (float) * 3, print_float_array, (set_uniform_of_size) glUniform3fv },
+	{ "vec4", sizeof (float) * 4, print_float_array, (set_uniform_of_size) glUniform4fv },
+	{ "int", sizeof (float), print_int_array, (set_uniform_of_size) glUniform1iv },
+	{ "ivec2", sizeof (float) * 2, print_int_array, (set_uniform_of_size) glUniform2iv },
+	{ "ivec3", sizeof (float) * 3, print_int_array, (set_uniform_of_size) glUniform3iv },
+	{ "ivec4", sizeof (float) * 4, print_int_array, (set_uniform_of_size) glUniform4iv },
+	{ "mat2", sizeof (float) * 2 * 2, print_float_array, (set_uniform_of_size) uniform_matrix_2fv_wrapper },
+	{ "mat3", sizeof (float) * 3 * 3, print_float_array, (set_uniform_of_size) uniform_matrix_3fv_wrapper },
+	{ "mat4", sizeof (float) * 4 * 4, print_float_array, (set_uniform_of_size) uniform_matrix_4fv_wrapper }
+};
+
+static int
+compile_shader(GLenum type, int count, const char **sources);
 
 static inline struct gl_output_state *
 get_output_state(struct weston_output *output)
@@ -758,6 +860,113 @@ shader_uniforms(struct gl_shader *shader,
 		glUniform1i(shader->tex_uniforms[i], i);
 }
 
+/* A temporary shim for now */
+static void
+override_shader (struct gl_renderer *gr,
+		 struct gl_surface_state *gs,
+		 struct weston_surface *surface,
+		 struct weston_output *output)
+{
+	/* recompile if necessary */
+	if (!gs->override.override_vertex_shader_id)
+		gs->override.override_vertex_shader_id =
+			compile_shader(GL_VERTEX_SHADER,
+				       1,
+				       (const char **) &gs->override.override_vertex_shader_string);
+
+	if (!gs->override.override_fragment_shader_id)
+		gs->override.override_fragment_shader_id =
+			compile_shader(GL_FRAGMENT_SHADER,
+				       1,
+				       (const char **) &gs->override.override_fragment_shader_string);
+
+	if (!gs->override.override_fragment_shader_id ||
+	    !gs->override.override_vertex_shader_id)
+		return;
+
+	if (!gs->override.override_program)
+	{
+		gs->override.override_program = glCreateProgram();
+		glAttachShader (gs->override.override_program,
+				gs->override.override_vertex_shader_id);
+		glAttachShader (gs->override.override_program,
+				gs->override.override_fragment_shader_id);
+	}
+
+	if (gs->override.relink_needed)
+	{
+		size_t attribute_index = 0;
+		GLuint *attribute_bindings_array = gs->override.attribute_bindings.data;
+		GLint status;
+		char msg[2048];
+		for (; attribute_index < gs->override.attribute_bindings.size; ++attribute_index)
+		{
+			glBindAttribLocation(gs->override.override_program,
+					     attribute_index,
+					     gs->override.override_attribute_names[attribute_index]);
+			attribute_bindings_array[attribute_index] = attribute_index;
+		}
+
+		glLinkProgram(gs->override.override_program);
+		glGetProgramiv(gs->override.override_program, GL_LINK_STATUS, &status);
+		if (!status) {
+			glGetProgramInfoLog(gs->override.override_program, sizeof msg, NULL, msg);
+			weston_log("link info: %s\n", msg);
+			return;
+		}
+	}
+
+	size_t i = 0;
+	GLuint *uniform_bindings_array = gs->override.uniform_bindings.data;
+	GLvoid *data = gs->override.override_data;
+	for (; i < gs->override.uniform_bindings.size; ++i)
+	{
+		if (!uniform_bindings_array[i] || gs->override.relink_needed)
+			uniform_bindings_array[i] =
+				glGetUniformLocation(gs->override.override_program,
+						     gs->override.override_uniform_names[i]);
+
+		/* Upload data */
+		enum renderer_variable_sizes variable_size =
+			gs->override.override_uniform_sizes[i];
+
+		/* Special case for projection matrix */
+		if (strcmp (gs->override.override_uniform_names[i], "proj") == 0)
+			(*variable_size_table[variable_size].set)(uniform_bindings_array[i],
+								  1,
+								  output->matrix.d);
+		else
+			(*variable_size_table[variable_size].set)(uniform_bindings_array[i],
+								  1,
+								  data);
+		data += variable_size_table[variable_size].size;
+	}
+
+	/* Special case for texture uniforms */
+	static const char *tex_uniform_names[] =
+	{
+		"tex",
+		"tex1",
+		"tex2"
+	};
+
+	for (i = 0; i < (size_t) gs->num_textures; ++i)
+	{
+		if (!gs->override.tex_uniforms[i] ||
+		    gs->override.relink_needed)
+			gs->override.tex_uniforms[i] =
+				glGetUniformLocation(gs->override.override_program,
+						     tex_uniform_names[i]);
+
+		glUniform1i(gs->override.tex_uniforms[i], i);
+	}
+
+	/* We need to NULL current_shader so that we force-change to it */
+	gr->current_shader = NULL;
+
+	glUseProgram(gs->override.override_program);
+}
+
 static void
 draw_surface(struct weston_surface *es, struct weston_output *output,
 	     pixman_region32_t *damage) /* in global coordinates */
@@ -787,8 +996,15 @@ draw_surface(struct weston_surface *es, struct weston_output *output,
 		shader_uniforms(&gr->solid_shader, es, output);
 	}
 
-	use_shader(gr, gs->shader);
-	shader_uniforms(gs->shader, es, output);
+	if (gs->override.use_override)
+	{
+		override_shader (gr, gs, es, output);
+	}
+	else
+	{
+		use_shader(gr, gs->shader);
+		shader_uniforms(gs->shader, es, output);
+	}
 
 	if (es->transform.enabled || output->zoom.active || output->scale != es->buffer_scale)
 		filter = GL_LINEAR;
@@ -808,6 +1024,7 @@ draw_surface(struct weston_surface *es, struct weston_output *output,
 	pixman_region32_subtract(&surface_blend, &surface_blend, &es->opaque);
 
 	if (pixman_region32_not_empty(&es->opaque)) {
+#if 0
 		if (gs->shader == &gr->texture_shader_rgba) {
 			/* Special case for RGBA textures with possibly
 			 * bad data in alpha channel: use the shader
@@ -817,7 +1034,7 @@ draw_surface(struct weston_surface *es, struct weston_output *output,
 			use_shader(gr, &gr->texture_shader_rgbx);
 			shader_uniforms(&gr->texture_shader_rgbx, es, output);
 		}
-
+#endif
 		if (es->alpha < 1.0)
 			glEnable(GL_BLEND);
 		else
@@ -827,7 +1044,14 @@ draw_surface(struct weston_surface *es, struct weston_output *output,
 	}
 
 	if (pixman_region32_not_empty(&surface_blend)) {
-		use_shader(gr, gs->shader);
+		if (gs->override.use_override)
+		{
+			override_shader(gr, gs, es, output);
+		}
+		else
+		{
+			use_shader(gr, gs->shader);
+		}
 		glEnable(GL_BLEND);
 		repaint_region(es, &repaint, &surface_blend);
 	}
@@ -1395,6 +1619,233 @@ gl_renderer_surface_set_color(struct weston_surface *surface,
 	gs->shader = &gr->solid_shader;
 }
 
+static inline void
+print_variable_array (const char *type,
+		      const char *name,
+		      enum renderer_variable_sizes size,
+		      size_t shared_mem_offset,
+		      void *data)
+{
+	size_t var_size = variable_size_table[size].size;
+
+	printf ("%s: %s of size %i and glsl type %s ",
+		type,
+		name,
+		(int) var_size,
+		variable_size_table[size].glsl_type);
+	(*variable_size_table[size].print) (data + shared_mem_offset,
+					    var_size);
+
+}
+
+typedef void (*reset_and_delete_id_func) (GLuint *id);
+
+static void
+reset_and_delete_shader (GLuint *id)
+{
+	if (*id)
+		glDeleteShader (*id);
+	*id = 0;
+}
+
+static void
+reset_and_delete_program (GLuint *id)
+{
+	if (*id)
+		glDeleteProgram (*id);
+	*id = 0;
+}
+
+static void
+replace_and_reset_id_if_different (char **dest,
+				   const char *src,
+				   GLuint *id,
+				   reset_and_delete_id_func func)
+{
+	if (*dest)
+	{
+		if (strcmp (*dest, src) != 0)
+		{
+			free (*dest);
+			*dest = strdup (src);
+			(*func) (id);
+		}
+	}
+	else
+	{
+		*dest = strdup (src);
+		(*func) (id);
+	}
+}
+
+static int
+compare_bindings (char **dest_names,
+		  enum renderer_variable_sizes *dest_sizes,
+		  const char **src_names,
+		  const enum renderer_variable_sizes *src_sizes,
+		  uint32_t dest_bindings_size)
+{
+	uint32_t i = 0;
+	for (; i < dest_bindings_size; ++i)
+	{
+		if (strcmp (dest_names[i], src_names[i]) ||
+			    dest_sizes[i] != src_sizes[i])
+			return 1;
+	}
+
+	return 0;
+}
+
+static void
+clear_bindings (char ***dest_names,
+		enum renderer_variable_sizes **dest_sizes,
+		uint32_t dest_bindings_size)
+{
+	uint32_t i = 0;
+	for (; i < dest_bindings_size; ++i)
+		free ((*dest_names)[i]);
+	free (*dest_names);
+	free (*dest_sizes);
+
+	*dest_names = NULL;
+
+}
+
+static uint32_t
+update_bindings (char ***dest_names,
+		 enum renderer_variable_sizes **dest_sizes,
+		 const char **src_names,
+		 const enum renderer_variable_sizes *src_sizes,
+		 struct wl_array *dest_bindings,
+		 uint32_t src_size)
+{
+	/* Check for difference in the first members */
+	int different = compare_bindings (*dest_names,
+					  *dest_sizes,
+					  src_names,
+					  src_sizes,
+					  dest_bindings->size);
+	uint32_t update_offset = dest_bindings->size;
+	uint32_t update_n = src_size - dest_bindings->size;
+
+	if (different)
+	{
+		clear_bindings (dest_names,
+				dest_sizes,
+				dest_bindings->size);
+		update_offset = 0;
+		update_n = src_size;
+	}
+
+	if (update_n)
+	{
+		*dest_names = realloc (*dest_names, sizeof (char *) * src_size);
+		*dest_sizes = realloc (*dest_sizes, sizeof (enum renderer_variable_sizes) * src_size);
+		wl_array_add (dest_bindings, update_n);
+	}
+
+	GLuint *dest_bindings_array = dest_bindings->data;
+
+	size_t index = update_offset;
+	for (; index < src_size; ++index)
+	{
+		(*dest_names)[index] = strdup (src_names[index]);
+		(*dest_sizes)[index] = src_sizes[index];
+		dest_bindings_array[index] = 0;
+	}
+
+	return update_n;
+}
+
+static void
+gl_renderer_override_gl_hook (struct weston_surface *surface,
+			      const char *vertex_shader,
+			      const char *fragment_shader,
+			      char **uniform_names,
+			      enum renderer_variable_sizes *uniform_sizes,
+			      uint32_t n_uniforms,
+			      char **attribute_names,
+			      enum renderer_variable_sizes *attribute_sizes,
+			      uint32_t n_attributes,
+			      void *data)
+{
+	size_t i = 0;
+	printf ("surface %p\n", surface);
+
+	size_t expected_data_size = 0;
+
+	for (i = 0; i < n_uniforms; ++i)
+	{
+		size_t var_size = variable_size_table[uniform_sizes[i]].size;
+		print_variable_array ("uniform",
+				      uniform_names[i],
+				      uniform_sizes[i],
+				      expected_data_size,
+				      data);
+
+		expected_data_size += var_size;
+	}
+
+	printf ("vertex shader = %s\n", vertex_shader);
+
+	/* Assuming four vertices right now */
+	size_t vidx = 0;
+	for (; vidx < 4; ++vidx)
+	{
+		printf ("data for vertex %i:\n", (int) vidx);
+		for (i = 0; i < n_attributes; ++i)
+		{
+			size_t var_size = variable_size_table[attribute_sizes[i]].size;
+			print_variable_array ("attribute",
+					      attribute_names[i],
+					      attribute_sizes[i],
+					      expected_data_size,
+					      data);
+
+			expected_data_size += var_size;
+		}
+	}
+	printf ("fragment shader = %s\n", fragment_shader);
+	printf ("using data %p : expecting a size of %i\n", data, (int) expected_data_size);
+
+	struct gl_surface_state *gs = get_surface_state(surface);
+
+	gs->override.use_override = 1;
+	replace_and_reset_id_if_different (&gs->override.override_vertex_shader_string,
+					   vertex_shader,
+					   &gs->override.override_vertex_shader_id,
+					   reset_and_delete_shader);
+	replace_and_reset_id_if_different (&gs->override.override_fragment_shader_string,
+					   fragment_shader,
+					   &gs->override.override_fragment_shader_id,
+					   reset_and_delete_shader);
+
+	/* Shader changed, so we need to re-link */
+	if (!gs->override.override_vertex_shader_id ||
+	    !gs->override.override_fragment_shader_id)
+	{
+		reset_and_delete_program (&gs->override.override_program);
+		gs->override.relink_needed = 1;
+	}
+
+	/* Check if our uniforms so far are the same */
+	update_bindings ((char ***) &gs->override.override_uniform_names,
+			 &gs->override.override_uniform_sizes,
+			 (const char **) uniform_names,
+			 uniform_sizes,
+			 &gs->override.uniform_bindings,
+			 n_uniforms);
+	if (update_bindings ((char ***) &gs->override.override_attribute_names,
+			     &gs->override.override_attribute_sizes,
+			     (const char **) attribute_names,
+			     attribute_sizes,
+			     &gs->override.attribute_bindings,
+			     n_attributes))
+		gs->override.relink_needed = 1;
+
+	gs->override.override_data = data;
+}
+
 static int
 gl_renderer_create_surface(struct weston_surface *surface)
 {
@@ -1912,6 +2363,7 @@ gl_renderer_create(struct weston_compositor *ec, EGLNativeDisplayType display,
 	gr->base.attach = gl_renderer_attach;
 	gr->base.create_surface = gl_renderer_create_surface;
 	gr->base.surface_set_color = gl_renderer_surface_set_color;
+	gr->base.override_gl_hook = gl_renderer_override_gl_hook;
 	gr->base.destroy_surface = gl_renderer_destroy_surface;
 	gr->base.destroy = gl_renderer_destroy;
 
@@ -1934,6 +2386,7 @@ gl_renderer_create(struct weston_compositor *ec, EGLNativeDisplayType display,
 	ec->renderer = &gr->base;
 	ec->capabilities |= WESTON_CAP_ROTATION_ANY;
 	ec->capabilities |= WESTON_CAP_CAPTURE_YFLIP;
+	ec->capabilities |= WESTON_CAP_OVERRIDE;
 
 	wl_display_add_shm_format(ec->wl_display, WL_SHM_FORMAT_RGB565);
 

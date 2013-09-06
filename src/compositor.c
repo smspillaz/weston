@@ -54,12 +54,64 @@
 
 #include "compositor.h"
 #include "subsurface-server-protocol.h"
+#include "composer-server-protocol.h"
 #include "../shared/os-compatibility.h"
 #include "git-version.h"
 #include "version.h"
 
 static struct wl_list child_process_list;
 static struct weston_compositor *segv_compositor;
+
+struct composer_shm_pool
+{
+	struct wl_resource *resource;
+	void *data;
+	uint32_t size;
+	int refcount;
+};
+
+struct composer_buffer
+{
+	struct wl_resource *resource;
+	struct composer_shm_pool *pool;
+	uint32_t offset;
+	uint32_t size;
+};
+
+struct composer_variable
+{
+	char *name;
+	enum renderer_variable_sizes size;
+};
+
+struct composer_surface
+{
+	struct wl_resource *resource;
+
+	struct weston_surface *surface;
+
+	char *vertex_shader;
+	char *fragment_shader;
+	struct composer_buffer *data_buffer;
+	struct wl_array uniforms;
+	struct wl_array attributes;
+
+	struct
+	{
+		char *vertex_shader;
+		char *fragment_shader;
+		struct composer_buffer *data_buffer;
+		struct wl_array uniforms;
+		struct wl_array attributes;
+	} next;
+};
+
+struct composer_animation_controller
+{
+	struct wl_resource *resource;
+};
+
+static void composer_surface_commit (struct composer_surface *csurface);
 
 static int
 sigchld_handler(int signal_number, void *data)
@@ -1143,6 +1195,96 @@ weston_surface_attach(struct weston_surface *surface,
 	surface->compositor->renderer->attach(surface, buffer);
 }
 
+static inline void
+variable_to_array_indexed (struct composer_variable **variables,
+			   char **names,
+			   uint32_t *sizes,
+			   size_t n)
+{
+	size_t i = 0;
+	for (; i < n; ++i)
+	{
+		names[i] = variables[i]->name;
+		sizes[i] = variables[i]->size;
+	}
+}
+
+static inline void
+cleanup_override_arrays (char **attribute_names,
+			 uint32_t *attribute_sizes,
+			 char **uniform_names,
+			 uint32_t *uniform_sizes)
+{
+	free (attribute_names);
+	free (uniform_names);
+	free (attribute_sizes);
+	free (uniform_sizes);
+}
+
+static void
+weston_surface_override(struct weston_surface *surface,
+			const char *vertex_shader,
+			const char *fragment_shader,
+			struct wl_array *attributes_array,
+			struct wl_array *uniforms_array,
+			struct composer_buffer *data_buffer)
+{
+	const size_t char_pointer_size = sizeof (const char *);
+	const size_t uint32_size = sizeof (uint32_t);
+
+	if (!surface->compositor->capabilities & WESTON_CAP_OVERRIDE)
+		return;
+
+	char **attributes_names_array = malloc (char_pointer_size * attributes_array->size);
+	char **uniforms_names_array = malloc (char_pointer_size * uniforms_array->size);
+
+	enum renderer_variable_sizes *attributes_sizes_array = malloc (uint32_size * attributes_array->size);
+	enum renderer_variable_sizes *uniforms_sizes_array = malloc (uint32_size * uniforms_array->size);
+
+	struct composer_variable **attributes = attributes_array->data;
+	struct composer_variable **uniforms = uniforms_array->data;
+
+	if (!attributes_names_array ||
+	    !attributes_sizes_array ||
+	    !uniforms_names_array ||
+	    !uniforms_sizes_array)
+	{
+		cleanup_override_arrays (attributes_names_array,
+					 attributes_sizes_array,
+					 uniforms_names_array,
+					 uniforms_sizes_array);
+		return;
+	}
+
+	variable_to_array_indexed (attributes,
+				   attributes_names_array,
+				   attributes_sizes_array,
+				   attributes_array->size);
+
+	variable_to_array_indexed (uniforms,
+				   uniforms_names_array,
+				   uniforms_sizes_array,
+				   uniforms_array->size);
+
+	void *data = data_buffer->pool->data + data_buffer->offset;
+
+	surface->compositor->renderer->override_gl_hook (surface,
+							 vertex_shader,
+							 fragment_shader,
+							 uniforms_names_array,
+							 uniforms_sizes_array,
+							 uniforms_array->size,
+							 attributes_names_array,
+							 attributes_sizes_array,
+							 attributes_array->size,
+							 data);
+
+	cleanup_override_arrays (attributes_names_array,
+				 attributes_sizes_array,
+				 uniforms_names_array,
+				 uniforms_sizes_array);
+}
+
 WL_EXPORT void
 weston_surface_restack(struct weston_surface *surface, struct wl_list *below)
 {
@@ -1624,6 +1766,9 @@ weston_surface_commit(struct weston_surface *surface)
 				  surface->geometry.height);
 	pixman_region32_intersect(&surface->input,
 				  &surface->input, &surface->pending.input);
+
+	/* composer */
+	composer_surface_commit (surface->csurface);
 
 	/* wl_surface.frame */
 	wl_list_insert_list(&surface->frame_callback_list,
@@ -2884,6 +3029,470 @@ weston_environment_get_fd(const char *env)
 	return fd;
 }
 
+static void cleanup_requested_file_descriptors (struct wl_client *client, int fd)
+{
+	wl_client_post_no_memory(client);
+	close (fd);
+}
+
+static struct composer_shm_pool * composer_shm_pool_ref (struct composer_shm_pool *pool)
+{
+	++pool->refcount;
+	return pool;
+}
+
+static void composer_shm_pool_unref (struct composer_shm_pool *pool)
+{
+	if (--pool->refcount == 0)
+	{
+		munmap (pool->data, pool->size);
+		wl_resource_destroy (pool->resource);
+		free (pool);
+	}
+}
+
+static void composer_buffer_destroy (struct wl_resource *resource)
+{
+	struct composer_buffer *buffer = wl_resource_get_user_data (resource);
+	composer_shm_pool_unref (buffer->pool);
+}
+
+static void composer_buffer_destroy_request (struct wl_client *client,
+					     struct wl_resource *resource)
+{
+	wl_resource_destroy (resource);
+}
+
+struct composer_buffer_interface weston_composer_buffer_implementation =
+{
+	composer_buffer_destroy_request
+};
+
+static void composer_buffer_release (struct composer_buffer *buffer)
+{
+	composer_buffer_send_release (buffer->resource);
+}
+
+static void composer_shm_pool_create_buffer (struct wl_client *client,
+					     struct wl_resource *resource,
+					     uint32_t id,
+					     uint32_t size,
+					     uint32_t offset)
+{
+	struct composer_buffer *buffer = zalloc (sizeof *buffer);
+	struct composer_shm_pool *pool = wl_resource_get_user_data (resource);
+
+	if (size + offset > pool->size)
+	{
+		wl_client_post_no_memory (client);
+		return;
+	}
+
+	if (!buffer)
+	{
+		wl_client_post_no_memory (client);
+		return;
+	}
+
+	buffer->resource = wl_resource_create (client,
+					       &composer_buffer_interface,
+					       1,
+					       id);
+
+	if (!buffer->resource)
+	{
+		free (buffer);
+		wl_client_post_no_memory (client);
+		return;
+	}
+
+	buffer->pool = composer_shm_pool_ref (pool);
+	buffer->offset = offset;
+	buffer->size = size;
+
+	wl_resource_set_implementation (buffer->resource,
+					&weston_composer_buffer_implementation,
+					buffer,
+					composer_buffer_destroy);
+}
+
+static void composer_shm_pool_resize (struct wl_client *client,
+				      struct wl_resource *resource,
+				      uint32_t size)
+{
+	struct composer_shm_pool *pool = wl_resource_get_user_data (resource);
+	void *next = mremap (pool->data, pool->size, size, MREMAP_MAYMOVE);
+
+	if (next == MAP_FAILED)
+		wl_resource_post_no_memory (resource);
+
+	pool->data = next;
+}
+
+static void composer_shm_pool_destroy_request (struct wl_client *client,
+					       struct wl_resource *resource)
+{
+	wl_resource_destroy (resource);
+}
+
+struct composer_shm_pool_interface weston_composer_shm_pool_implementation =
+{
+	composer_shm_pool_create_buffer,
+	composer_shm_pool_resize,
+	composer_shm_pool_destroy_request
+};
+
+static void destroy_composer_shm_pool(struct wl_resource *resource)
+{
+	struct composer_shm_pool *pool = wl_resource_get_user_data (resource);
+	composer_shm_pool_unref (pool);
+}
+
+static void cleanup_shm_pool (struct wl_client *client, int fd, struct composer_shm_pool *pool)
+{
+	cleanup_requested_file_descriptors(client, fd);
+	free(pool);
+}
+
+static void composer_create_shm_pool (struct wl_client *client, struct wl_resource *resource,
+				      uint32_t id, int fd, uint32_t size)
+{
+	struct composer_shm_pool *pool = zalloc(sizeof *pool);
+	if (pool == NULL) {
+		cleanup_requested_file_descriptors(client, fd);
+		return;
+	}
+
+	if (size <= 0) {
+		cleanup_shm_pool(client, fd, pool);
+		return;
+	}
+
+	pool->size = size;
+	pool->data = mmap(NULL, size,
+			  PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (pool->data == MAP_FAILED) {
+		cleanup_shm_pool(client, fd, pool);
+		return;
+	}
+
+	pool->resource =
+		wl_resource_create(client, &composer_shm_pool_interface, 1, id);
+	if (!pool->resource) {
+		munmap(pool->data, pool->size);
+		cleanup_shm_pool(client, fd, pool);
+		return;
+	}
+
+	composer_shm_pool_ref (pool);
+
+	wl_resource_set_implementation(pool->resource,
+				       &weston_composer_shm_pool_implementation,
+				       pool,
+				       destroy_composer_shm_pool);
+
+	close (fd);
+}
+
+static inline void apply_next_string_unconditional (char **dest, char **next)
+{
+	if (*dest)
+		free (*dest);
+
+	*dest = *next;
+	*next = NULL;
+}
+
+static inline void apply_next_string_if_available (char **dest, char **next)
+{
+	if (*next)
+		apply_next_string_unconditional (dest, next);
+}
+
+static inline void copy_apply_next_string_if_available (char **dest, const char *next)
+{
+	if (next)
+	{
+		char *next_copy = strdup (next);
+		apply_next_string_if_available (dest, &next_copy);
+	}
+}
+
+static void composer_surface_override_vertex_shader (struct wl_client *client,
+						     struct wl_resource *resource,
+						     const char *vertex_shader,
+						     uint32_t size)
+{
+	struct composer_surface *csurface = wl_resource_get_user_data (resource);
+	copy_apply_next_string_if_available (&csurface->next.vertex_shader,
+					     vertex_shader);
+}
+
+static void composer_surface_override_fragment_shader (struct wl_client *client,
+						       struct wl_resource *resource,
+						       const char *fragment_shader,
+						       uint32_t size)
+{
+	struct composer_surface *csurface = wl_resource_get_user_data (resource);
+	copy_apply_next_string_if_available (&csurface->next.fragment_shader,
+					     fragment_shader);
+}
+
+static struct composer_variable * allocate_variable (struct wl_resource *resource,
+						     const char *name,
+						     uint32_t size)
+{
+	struct composer_variable *variable = zalloc (sizeof *variable);
+
+	if (!variable)
+		wl_resource_post_no_memory (resource);
+
+	if ((enum renderer_variable_sizes) size > V4FMatrix)
+	{
+		printf ("invalid var size %ui\n", size);
+		wl_resource_post_no_memory (resource);
+	}
+
+	variable->size = (enum renderer_variable_sizes) size;
+	variable->name = strdup (name);
+
+	if (!variable->name)
+	{
+		wl_resource_post_no_memory (resource);
+		free (variable);
+	}
+
+	return variable;
+}
+
+static void append_variable_to_array (struct wl_array *array,
+				      struct composer_variable *variable)
+{
+	size_t last_size = array->size;
+	wl_array_add (array, 1);
+	((struct composer_variable **) array->data)[last_size] = variable;
+}
+
+static void composer_surface_attach_uniform (struct wl_client *client,
+					     struct wl_resource *resource,
+					     const char *name,
+					     uint32_t size)
+{
+	struct composer_surface *csurface = wl_resource_get_user_data (resource);
+	struct composer_variable *variable = allocate_variable (resource, name, size);
+
+	if (!variable)
+		return;
+
+	append_variable_to_array (&csurface->uniforms, variable);
+}
+
+static void composer_surface_attach_attribute (struct wl_client *client,
+					       struct wl_resource *resource,
+					       const char *name,
+					       uint32_t size)
+{
+	struct composer_surface *csurface = wl_resource_get_user_data (resource);
+	struct composer_variable *variable = allocate_variable (resource, name, size);
+
+	if (!variable)
+		return;
+
+	append_variable_to_array (&csurface->attributes, variable);
+}
+
+static void composer_surface_attach_data_buffer (struct wl_client *client,
+						 struct wl_resource *resource,
+						 struct wl_resource *data_buffer_resource)
+{
+	struct composer_surface *csurface = wl_resource_get_user_data (resource);
+	struct composer_buffer *buffer = wl_resource_get_user_data (data_buffer_resource);
+
+	csurface->next.data_buffer = buffer;
+}
+
+static void composer_surface_destroy_request (struct wl_client *client,
+					      struct wl_resource *resource)
+{
+	wl_resource_destroy (resource);
+}
+
+struct composer_surface_interface weston_composer_surface_implementation =
+{
+	composer_surface_override_vertex_shader,
+	composer_surface_override_fragment_shader,
+	composer_surface_attach_uniform,
+	composer_surface_attach_attribute,
+	composer_surface_attach_data_buffer,
+	composer_surface_destroy_request
+};
+
+static inline void move_array_items_to_end (struct wl_array *dest, struct wl_array *source)
+{
+	size_t previous_dest_size = dest->size;
+
+	wl_array_add (dest, source->size);
+
+	void *array_dest = dest->data + dest->alloc * previous_dest_size;
+	void *array_source = source->data;
+
+	memcpy (array_dest, array_source, source->size * source->alloc);
+
+	wl_array_release (source);
+	wl_array_init (source);
+
+	source->alloc = sizeof (struct composer_variable *);
+}
+
+static void composer_surface_commit (struct composer_surface *csurface)
+{
+	if (!csurface)
+		return;
+
+	apply_next_string_if_available (&csurface->vertex_shader,
+					&csurface->next.vertex_shader);
+	apply_next_string_if_available (&csurface->fragment_shader,
+					&csurface->next.fragment_shader);
+
+	if (csurface->next.data_buffer)
+	{
+		if (csurface->data_buffer)
+			composer_buffer_release (csurface->data_buffer);
+		csurface->data_buffer = csurface->next.data_buffer;
+	}
+
+	move_array_items_to_end (&csurface->uniforms,
+				 &csurface->next.uniforms);
+	move_array_items_to_end (&csurface->attributes,
+				 &csurface->next.uniforms);
+
+	if (csurface->vertex_shader &&
+	    csurface->fragment_shader)
+	{
+		weston_surface_override (csurface->surface,
+					 csurface->vertex_shader,
+					 csurface->fragment_shader,
+					 &csurface->attributes,
+					 &csurface->uniforms,
+					 csurface->data_buffer);
+	}
+}
+
+typedef void (*wl_array_destroy_element_func) (void *element,
+					       void *user_data);
+
+static void array_destroy_elements (struct wl_array *array,
+				    wl_array_destroy_element_func func,
+				    void *user_data)
+{
+	size_t i = 0;
+	for (; i < array->size; ++i)
+	{
+		size_t alloc = array->alloc ? array->alloc : 16;
+		void *data = array->data + i * alloc;
+		(*func) (data, user_data);
+	}
+
+	wl_array_release (array);
+}
+
+static void destroy_composer_varible (void *element,
+				      void *user_data)
+{
+	struct composer_variable *variable = (struct composer_variable *) element;
+	free (variable->name);
+	free (variable);
+}
+
+static void destroy_composer_surface (struct wl_resource *resource)
+{
+	struct composer_surface *csurface = wl_resource_get_user_data (resource);
+
+	composer_surface_commit (csurface);
+
+	if (csurface->vertex_shader)
+		free (csurface->vertex_shader);
+	if (csurface->fragment_shader)
+		free (csurface->fragment_shader);
+
+	array_destroy_elements (&csurface->uniforms,
+				destroy_composer_varible,
+				NULL);
+	array_destroy_elements (&csurface->attributes,
+				destroy_composer_varible,
+				NULL);
+
+	if (csurface->data_buffer)
+		composer_buffer_release (csurface->data_buffer);
+
+	csurface->surface->csurface = NULL;
+
+	free (csurface);
+}
+
+static void composer_get_composer_animation_controller_for_surface (struct wl_client *client,
+								    struct wl_resource *resource,
+								    uint32_t id,
+								    struct wl_resource *surface_resource)
+{
+	struct weston_surface *wsurface = wl_resource_get_user_data (surface_resource);
+	struct composer_surface *csurface = zalloc (sizeof *csurface);
+	csurface->resource = wl_resource_create (client,
+						 &composer_surface_interface,
+						 1,
+						 id);
+	if (!csurface->resource)
+	{
+		wl_resource_post_no_memory (resource);
+		return;
+	}
+
+	csurface->surface = wsurface;
+	wsurface->csurface = csurface;
+
+	wl_array_init (&csurface->uniforms);
+	wl_array_init (&csurface->attributes);
+
+	wl_array_init (&csurface->next.uniforms);
+	wl_array_init (&csurface->next.attributes);
+
+	wl_resource_set_implementation (csurface->resource,
+					&weston_composer_surface_implementation,
+					csurface,
+					destroy_composer_surface);
+}
+
+const struct composer_animation_controller_interface weston_composer_animation_controller_implementation =
+{
+	composer_get_composer_animation_controller_for_surface,
+	composer_create_shm_pool
+};
+
+static void
+unbind_composer(struct wl_resource *resource)
+{
+	struct weston_composer *composer = wl_resource_get_user_data(resource);
+	(void) composer;
+}
+
+static void
+bind_composer(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct weston_composer *composer = data;
+
+	struct wl_resource *resource =
+		wl_resource_create(client,
+				   &composer_animation_controller_interface,
+				   version,
+				   id);
+	if (resource)
+		wl_resource_set_implementation(resource,
+					       &weston_composer_animation_controller_implementation,
+					       composer,
+					       unbind_composer);
+}
+
+
 WL_EXPORT int
 weston_compositor_init(struct weston_compositor *ec,
 		       struct wl_display *display,
@@ -2916,6 +3525,10 @@ weston_compositor_init(struct weston_compositor *ec,
 
 	if (!wl_global_create(display, &wl_subcompositor_interface, 1,
 			      ec, bind_subcompositor))
+		return -1;
+
+	if (wl_global_create(display, &composer_animation_controller_interface, 1,
+			     ec, bind_composer) == NULL)
 		return -1;
 
 	wl_list_init(&ec->surface_list);
@@ -3009,6 +3622,7 @@ static const struct {
 } capability_strings[] = {
 	{ WESTON_CAP_ROTATION_ANY, "arbitrary surface rotation:" },
 	{ WESTON_CAP_CAPTURE_YFLIP, "screen capture uses y-flip:" },
+	{ WESTON_CAP_OVERRIDE, "gl override:" }
 };
 
 static void

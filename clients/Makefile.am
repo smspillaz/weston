@@ -39,7 +39,9 @@ simple_clients_programs =			\
 
 weston_simple_shm_SOURCES = simple-shm.c 	\
 	../shared/os-compatibility.c		\
-	../shared/os-compatibility.h
+        ../shared/os-compatibility.h            \
+        composer-protocol.c                     \
+        composer-client-protocol.h
 weston_simple_shm_CPPFLAGS = $(SIMPLE_CLIENT_CFLAGS)
 weston_simple_shm_LDADD = $(SIMPLE_CLIENT_LIBS)
 
@@ -226,7 +228,9 @@ BUILT_SOURCES =					\
 	subsurface-client-protocol.h		\
 	subsurface-protocol.c			\
 	workspaces-client-protocol.h		\
-	workspaces-protocol.c
+        workspaces-protocol.c                   \
+        composer-protocol.c                     \
+        composer-client-protocol.h
 
 CLEANFILES = $(BUILT_SOURCES)
 endif
